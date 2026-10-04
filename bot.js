@@ -84,12 +84,216 @@ function checkFlagAnswer(userAnswer, flagObject) {
     return normalizedUser === normalizedArabic || normalizedUser === normalizedEnglish;
 }
 
-// دالة فحص فلتر السب — تتحقق لو النص يحتوي أي كلمة من BANNED_WORDS بعد التطبيع
-// (يعني تتجاهل فروقات الأحرف والمسافات، نفس منطق التحقق من إجابات الألعاب)
+// ================= [ فلتر السب المطوّر ] =================
+// الفحص يتم على مستوى الكلمة الكاملة (مع احتساب السوابق العربية: و، ف، ب، ل، ك، ال، وال، بال...)
+// عشان ما ينحذف كلام بريء فيه نفس الحروف داخل كلمة ثانية. ويتجاهل: التشكيل، التطويل (ـ)،
+// تكرار الحروف (حمااار)، الرموز بين الحروف (ح.م.ا.ر / ح*م*ا*ر)، والحروف المفصولة بمسافات (ح م ا ر).
+//
+// صيغ الكتابة بـ badwords.js:
+//   "كلمة"      → تطابق الكلمة كاملة فقط (الافتراضي، الأدق)
+//   "كلمة*"     → تطابق لو ظهرت بأي مكان داخل الكلام حتى وسط كلمة ثانية (للكلمات الشديدة بس)
+//   "جملة كاملة" → أكثر من كلمة تتحقق كعبارة
+function collapseRepeats(s) { return s.replace(/(.)\1+/gu, '$1'); }
+
+function normalizeForFilter(text) {
+    return collapseRepeats(
+        (text || '')
+            .toLowerCase()
+            .replace(/[\u200B-\u200F\u202A-\u202E\u2060\uFEFF]/g, '') // محارف خفية
+            .replace(/[\u064B-\u065F\u0670\u0640]/g, '')               // تشكيل + تطويل
+            .replace(/[أإآ]/g, 'ا')
+            .replace(/ة/g, 'ه')
+            .replace(/ى/g, 'ي')
+            .replace(/ؤ/g, 'و')
+            .replace(/ئ/g, 'ي')
+    );
+}
+
+function filterTokens(s) { return s.split(/[^\p{L}\p{N}]+/u).filter(Boolean); }
+
+// "ح" "م" "ا" "ر" (حروف مفردة متتالية) → نضيف نسخة مدموجة "حمار" للفحص
+function joinSingleLetterRuns(tokens) {
+    const out = [...tokens];
+    let run = '';
+    for (const t of tokens) {
+        if (t.length === 1) { run += t; continue; }
+        if (run.length > 1) out.push(collapseRepeats(run));
+        run = '';
+    }
+    if (run.length > 1) out.push(collapseRepeats(run));
+    return out;
+}
+
+const INTRA_WORD_SYMBOLS = /(?<=\p{L})[^\p{L}\p{N}\s]+(?=\p{L})/gu; // رموز محشورة بين حرفين
+const FILTER_PREFIXES = ['', 'و', 'ف', 'ب', 'ل', 'ك', 'ال', 'وال', 'بال', 'فال', 'كال', 'لل', 'ولل'];
+const FILTER_WHOLE_FORMS = new Set();
+const FILTER_PHRASES = [];
+const FILTER_CONTAINS_WORDS = [];
+
+for (const raw of BANNED_WORDS) {
+    const trimmed = String(raw).trim();
+    if (!trimmed) continue;
+    const isContains = trimmed.endsWith('*');
+    const parts = filterTokens(normalizeForFilter(trimmed.replace(/\*+$/, '')));
+    if (!parts.length) continue;
+
+    if (isContains) {
+        FILTER_CONTAINS_WORDS.push(parts.join(''));
+    } else if (parts.length > 1) {
+        FILTER_PHRASES.push(parts.join(' '));
+    } else {
+        for (const p of FILTER_PREFIXES) FILTER_WHOLE_FORMS.add(collapseRepeats(normalizeForFilter(p) + parts[0]));
+    }
+}
+
 function containsBannedWord(text) {
-    if (!BANNED_WORDS.length) return false; // القائمة فاضية = الفلتر ما يسوي شي حتى لو مفعّل
-    const normalized = normalizeText(text);
-    return BANNED_WORDS.some(word => normalized.includes(normalizeText(word)));
+    if (!text) return false;
+    if (!FILTER_WHOLE_FORMS.size && !FILTER_PHRASES.length && !FILTER_CONTAINS_WORDS.length) return false; // القائمة فاضية = الفلتر ما يسوي شي
+
+    const normalized = normalizeForFilter(text);
+    const variants = [normalized, normalized.replace(INTRA_WORD_SYMBOLS, '')];
+
+    for (const variant of variants) {
+        const baseTokens = filterTokens(variant);
+        if (joinSingleLetterRuns(baseTokens).some(t => FILTER_WHOLE_FORMS.has(t))) return true;
+        if (FILTER_PHRASES.length) {
+            const padded = ` ${baseTokens.join(' ')} `;
+            if (FILTER_PHRASES.some(p => padded.includes(` ${p} `))) return true;
+        }
+    }
+
+    if (FILTER_CONTAINS_WORDS.length) {
+        const stripped = normalized.replace(/[^\p{L}\p{N}]+/gu, '');
+        if (FILTER_CONTAINS_WORDS.some(w => stripped.includes(w))) return true;
+    }
+    return false;
+}
+
+// ================= [ نظام التحذيرات + سجل الإدارة ] =================
+const MAX_WARNINGS = 3;                           // عند الوصول لهالعدد (تحذيرات فعّالة) تنطبق العقوبة التلقائية
+const WARN_PUNISHMENT_MS = 24 * 60 * 60 * 1000;   // مدة الإسكات عند الحد الأقصى (٢٤ ساعة) — خلّها 0 لو ما تبي عقوبة تلقائية
+// مدة صلاحية التحذير (٣٠ يوم) تعدّلها من WARN_EXPIRY_MS بملف db.js
+
+function formatArabicDuration(msVal) {
+    const d = Math.floor(msVal / 86400000);
+    const h = Math.floor((msVal % 86400000) / 3600000);
+    const m = Math.floor((msVal % 3600000) / 60000);
+    const s = Math.floor((msVal % 60000) / 1000);
+    const parts = [];
+    if (d) parts.push(`${d} يوم`);
+    if (h) parts.push(`${h} ساعة`);
+    if (m) parts.push(`${m} دقيقة`);
+    if (s && !d && !h) parts.push(`${s} ثانية`);
+    return parts.join(' و ') || '0 ثانية';
+}
+
+// يبني embed موحّد لقناة سجل الإدارة
+function buildModLogEmbed({ title, color, targetUser = null, moderatorId = null, reason = null, fields = [] }) {
+    const embed = new EmbedBuilder().setTitle(title).setColor(color).setTimestamp();
+    if (targetUser) embed.addFields({ name: 'العضو', value: `${targetUser} (\`${targetUser.id}\`)`, inline: true });
+    if (moderatorId) embed.addFields({ name: 'بواسطة', value: moderatorId === client.user.id ? 'النظام التلقائي' : `<@${moderatorId}>`, inline: true });
+    if (reason) embed.addFields({ name: 'السبب', value: String(reason).slice(0, 1000) });
+    if (fields.length) embed.addFields(fields);
+    return embed;
+}
+
+// يرسل لقناة السجل لو محددة بـ /setmodlog (وما يوقف شي لو فشل)
+async function sendModLog(guild, embed) {
+    try {
+        const cfg = db.getConfig(guild.id);
+        if (!cfg.modlog_channel_id) return;
+        const channel = guild.channels.cache.get(cfg.modlog_channel_id) || await guild.channels.fetch(cfg.modlog_channel_id).catch(() => null);
+        if (channel) await channel.send({ embeds: [embed] });
+    } catch (e) {
+        console.error('❌ [ModLog] فشل الإرسال:', e.message);
+    }
+}
+
+// رسالة خاصة للعضو عند إسكات/طرد/حظر
+async function sendModActionDM(targetUser, guild, title, color, reason, durationText = null) {
+    const embed = new EmbedBuilder()
+        .setTitle(title)
+        .setDescription(`في سيرفر **${guild.name}**`)
+        .addFields({ name: 'السبب', value: reason.slice(0, 1000) })
+        .setColor(color)
+        .setTimestamp();
+    if (durationText) embed.addFields({ name: 'المدة', value: durationText, inline: true });
+    return targetUser.send({ embeds: [embed] }).then(() => true).catch(() => false);
+}
+
+// فحوصات مشتركة لأوامر الإدارة (نفس منطق /warn)
+function validateModTarget(interaction, targetUser, targetMember) {
+    if (targetUser.id === interaction.user.id) return '❌ ما تقدر تطبّق هذا على نفسك.';
+    if (targetUser.id === client.user.id) return '❌ ما أقدر أطبّق هذا على نفسي.';
+    if (targetUser.id === interaction.guild.ownerId) return '❌ ما تقدر تطبّق هذا على مالك السيرفر.';
+    if (targetMember) {
+        const isOwner = interaction.guild.ownerId === interaction.user.id;
+        if (!isOwner && targetMember.roles.highest.position >= interaction.member.roles.highest.position) {
+            return '❌ رتبة هذا العضو أعلى منك أو تساوي رتبتك.';
+        }
+    }
+    return null;
+}
+
+// يسجل التحذير، يرسل للعضو رسالة خاصة بالسبب، ينفذ العقوبة لو وصل الحد، ويسجل بقناة الإدارة
+// evidence = نص الرسالة المحذوفة (للتحذيرات التلقائية) ويظهر لطاقم الإدارة بس
+async function issueWarning(guild, targetUser, moderatorId, reason, evidence = null) {
+    const warningId = db.addWarning(guild.id, targetUser.id, moderatorId, reason);
+    const count = db.countWarnings(guild.id, targetUser.id); // الفعّالة فقط
+    const reachedLimit = count >= MAX_WARNINGS;
+
+    let punished = false;
+    if (reachedLimit && WARN_PUNISHMENT_MS > 0) {
+        const member = await guild.members.fetch(targetUser.id).catch(() => null);
+        if (member && member.moderatable && !member.permissions.has(PermissionFlagsBits.Administrator)) {
+            punished = await member.timeout(WARN_PUNISHMENT_MS, `وصل ${MAX_WARNINGS} تحذيرات`).then(() => true).catch(() => false);
+        }
+    }
+
+    const expiryDays = Math.round(db.WARN_EXPIRY_MS / 86400000);
+    const dmEmbed = new EmbedBuilder()
+        .setTitle('⚠️ تم تحذيرك')
+        .setDescription(`تم تحذيرك في سيرفر **${guild.name}**.\nيسقط هذا التحذير تلقائياً بعد ${expiryDays} يوم.`)
+        .addFields(
+            { name: 'السبب', value: reason.slice(0, 1000) },
+            { name: 'عدد تحذيراتك', value: `${count} / ${MAX_WARNINGS}`, inline: true }
+        )
+        .setColor(reachedLimit ? '#ED4245' : '#FEE75C')
+        .setTimestamp();
+
+    if (reachedLimit) {
+        dmEmbed.setFooter({ text: punished ? `وصلت للحد الأقصى من التحذيرات، تم إسكاتك ${formatArabicDuration(WARN_PUNISHMENT_MS)}.` : 'وصلت للحد الأقصى من التحذيرات.' });
+    } else if (count === MAX_WARNINGS - 1) {
+        dmEmbed.setFooter({ text: 'باقي تحذير واحد وتنطبق عليك العقوبة، التزم بقوانين السيرفر.' });
+    }
+
+    const dmSent = await targetUser.send({ embeds: [dmEmbed] }).then(() => true).catch(() => false);
+
+    db.logEvent(guild.id, 'security', moderatorId, 'warning_issued', {
+        warningId, targetUserId: targetUser.id, reason, count, punished, dmSent
+    });
+
+    const logFields = [
+        { name: 'التحذيرات الفعّالة', value: `${count} / ${MAX_WARNINGS}`, inline: true },
+        { name: 'الخاص', value: dmSent ? 'وصلته الرسالة' : 'الخاص مقفل', inline: true }
+    ];
+    if (reachedLimit && WARN_PUNISHMENT_MS > 0) {
+        logFields.push({ name: 'العقوبة', value: punished ? `إسكات ${formatArabicDuration(WARN_PUNISHMENT_MS)}` : 'ما انطبقت (صلاحيات البوت أو العضو أدمن)', inline: true });
+    }
+    if (evidence) logFields.push({ name: 'الرسالة المحذوفة', value: evidence.slice(0, 1000) });
+    sendModLog(guild, buildModLogEmbed({
+        title: `⚠️ تحذير جديد (#${warningId})`,
+        color: reachedLimit ? '#ED4245' : '#FEE75C',
+        targetUser, moderatorId, reason, fields: logFields
+    }));
+
+    return { warningId, count, reachedLimit, punished, dmSent };
+}
+
+// تحذير تلقائي من رسالة (الأدمن معفى)
+async function autoWarnMember(message, reason) {
+    if (message.member?.permissions.has(PermissionFlagsBits.Administrator)) return null;
+    return issueWarning(message.guild, message.author, client.user.id, reason, message.content || null);
 }
 
 // ================= [ بنك الأسئلة الضخم والمحدث ] =================
@@ -635,13 +839,69 @@ client.once('ready', async () => {
         .addBooleanOption(opt => opt.setName('enabled').setDescription('تفعيل أو تعطيل').setRequired(true))
         .setDefaultMemberPermissions(PermissionFlagsBits.Administrator);
 
+    const warnCommand = new SlashCommandBuilder()
+        .setName('warn')
+        .setDescription('تحذير عضو (يوصله خاص مع السبب)')
+        .addUserOption(opt => opt.setName('user').setDescription('العضو').setRequired(true))
+        .addStringOption(opt => opt.setName('reason').setDescription('سبب التحذير').setRequired(true).setMaxLength(500))
+        .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers);
+
+    const warningsCommand = new SlashCommandBuilder()
+        .setName('warnings')
+        .setDescription('عرض تحذيرات عضو')
+        .addUserOption(opt => opt.setName('user').setDescription('العضو').setRequired(true))
+        .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers);
+
+    const unwarnCommand = new SlashCommandBuilder()
+        .setName('unwarn')
+        .setDescription('حذف تحذير واحد برقمه (الرقم يظهر بـ /warnings)')
+        .addIntegerOption(opt => opt.setName('id').setDescription('رقم التحذير').setRequired(true).setMinValue(1))
+        .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers);
+
+    const clearWarningsCommand = new SlashCommandBuilder()
+        .setName('clearwarnings')
+        .setDescription('مسح كل تحذيرات عضو')
+        .addUserOption(opt => opt.setName('user').setDescription('العضو').setRequired(true))
+        .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers);
+
+    const setModlogCommand = new SlashCommandBuilder()
+        .setName('setmodlog')
+        .setDescription('تحديد قناة سجل الإدارة (التحذيرات والعقوبات)')
+        .addChannelOption(opt => opt.setName('channel').setDescription('قناة السجل (يفضّل تكون خاصة بالإدارة)').setRequired(true))
+        .setDefaultMemberPermissions(PermissionFlagsBits.Administrator);
+
+    const timeoutCommand = new SlashCommandBuilder()
+        .setName('timeout')
+        .setDescription('إسكات عضو لمدة محددة')
+        .addUserOption(opt => opt.setName('user').setDescription('العضو').setRequired(true))
+        .addStringOption(opt => opt.setName('duration').setDescription('المدة مثل 10m أو 2h أو 1d (من 5 ثواني إلى 28 يوم)').setRequired(true).setMaxLength(20))
+        .addStringOption(opt => opt.setName('reason').setDescription('السبب').setRequired(true).setMaxLength(500))
+        .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers);
+
+    const kickCommand = new SlashCommandBuilder()
+        .setName('kick')
+        .setDescription('طرد عضو من السيرفر')
+        .addUserOption(opt => opt.setName('user').setDescription('العضو').setRequired(true))
+        .addStringOption(opt => opt.setName('reason').setDescription('السبب').setRequired(true).setMaxLength(500))
+        .setDefaultMemberPermissions(PermissionFlagsBits.KickMembers);
+
+    const banCommand = new SlashCommandBuilder()
+        .setName('ban')
+        .setDescription('حظر عضو من السيرفر')
+        .addUserOption(opt => opt.setName('user').setDescription('العضو').setRequired(true))
+        .addStringOption(opt => opt.setName('reason').setDescription('السبب').setRequired(true).setMaxLength(500))
+        .addIntegerOption(opt => opt.setName('delete_days').setDescription('حذف رسائله آخر كم يوم (0-7)').setMinValue(0).setMaxValue(7))
+        .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers);
+
     try {
         await client.application.commands.set([
             command, adminCommand, addFakeCommand, statsCommand, 
             rankCommand, setChannelCommand, setLevelCommand, dailyCommand,
             setWelcomeChannelCommand, setGoodbyeChannelCommand, setShopChannelCommand,
             setGameChannelCommand, setStatsChannelCommand,
-            setupShopCommand, securityCommand
+            setupShopCommand, securityCommand,
+            warnCommand, warningsCommand, unwarnCommand, clearWarningsCommand,
+            setModlogCommand, timeoutCommand, kickCommand, banCommand
         ]);
         console.log('🚀 MMR System initialized with Dynamic Configuration Commands.');
     } catch (error) {
@@ -906,9 +1166,14 @@ client.on('messageCreate', async message => {
     // --- فلتر السب ---
     if (securityCfg.profanity_filter_enabled && containsBannedWord(message.content)) {
         await message.delete().catch(() => null);
-        const warnMsg = await message.channel.send(`⚠️ ${message.author}، رجاءً التزم بآداب الحوار بالسيرفر.`).catch(() => null);
-        if (warnMsg) setTimeout(() => warnMsg.delete().catch(() => null), 5000);
         db.logEvent(message.guild.id, 'security', message.author.id, 'profanity_blocked', { content: message.content });
+
+        let noticeText = `⚠️ ${message.author}، رجاءً التزم بآداب الحوار بالسيرفر.`;
+        // الأدمن ما ينحذّر تلقائياً (رسالته تنحذف بس)، غيره يتسجل عليه تحذير ويوصله خاص
+        const result = await autoWarnMember(message, 'استخدام ألفاظ غير لائقة (تحذير تلقائي من الفلتر)');
+        if (result) noticeText = `⚠️ ${message.author}، تم حذف رسالتك وتسجيل تحذير عليك (${result.count}/${MAX_WARNINGS}).`;
+        const warnMsg = await message.channel.send(noticeText).catch(() => null);
+        if (warnMsg) setTimeout(() => warnMsg.delete().catch(() => null), 5000);
         return;
     }
 
@@ -917,9 +1182,13 @@ client.on('messageCreate', async message => {
         // الأدمن معفى من الفلتر عشان يقدر يشارك روابط دعوة لو احتاج
         if (!message.member.permissions.has(PermissionFlagsBits.Administrator)) {
             await message.delete().catch(() => null);
-            const warnMsg = await message.channel.send(`⚠️ ${message.author}، ما يُسمح بمشاركة روابط دعوة سيرفرات ثانية هنا.`).catch(() => null);
-            if (warnMsg) setTimeout(() => warnMsg.delete().catch(() => null), 5000);
             db.logEvent(message.guild.id, 'security', message.author.id, 'invite_link_blocked', { content: message.content });
+            const result = await autoWarnMember(message, 'إرسال رابط دعوة سيرفر آخر (تحذير تلقائي)');
+            const warnMsg = await message.channel.send(result
+                ? `⚠️ ${message.author}، ما يُسمح بمشاركة روابط دعوة سيرفرات ثانية هنا — تم تسجيل تحذير عليك (${result.count}/${MAX_WARNINGS}).`
+                : `⚠️ ${message.author}، ما يُسمح بمشاركة روابط دعوة سيرفرات ثانية هنا.`
+            ).catch(() => null);
+            if (warnMsg) setTimeout(() => warnMsg.delete().catch(() => null), 5000);
             return;
         }
     }
@@ -942,6 +1211,7 @@ client.on('messageCreate', async message => {
 
             spamTracker.delete(trackerKey); // نصفّي السجل عشان ما يتكرر الإسكات كل رسالة زايدة
             db.logEvent(message.guild.id, 'security', message.author.id, 'spam_detected_timeout', { messageCount: timestamps.length });
+            await autoWarnMember(message, 'سبام — إرسال رسائل كثيرة بسرعة (تحذير تلقائي)');
             return;
         }
     }
@@ -1440,6 +1710,207 @@ client.on('interactionCreate', async interaction => {
                 .setColor(enabled ? '#248046' : '#8B93A8');
 
             return interaction.reply({ embeds: [securityEmbed], ephemeral: true });
+        }
+
+        if (commandName === 'setmodlog') {
+            const selectedChan = options.getChannel('channel');
+
+            if (selectedChan.type !== ChannelType.GuildText) {
+                return interaction.reply({ content: '❌ يرجى اختيار قناة نصية صالحة!', ephemeral: true });
+            }
+            const botPerms = selectedChan.permissionsFor(interaction.guild.members.me);
+            if (!botPerms?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks])) {
+                return interaction.reply({ content: '❌ البوت ما عنده صلاحية (رؤية القناة + إرسال الرسائل + تضمين الروابط) بهالقناة.', ephemeral: true });
+            }
+
+            db.setModlogChannel(interaction.guildId, selectedChan.id);
+            db.logEvent(interaction.guildId, 'admin', interaction.user.id, 'setmodlog', { channelId: selectedChan.id });
+
+            const modlogEmbed = new EmbedBuilder()
+                .setTitle('✅ تم إعداد قناة سجل الإدارة')
+                .setDescription(`التحذيرات والإسكات والطرد والحظر بتنسجل الحين بقناة: ${selectedChan}`)
+                .setColor('#248046');
+            return interaction.reply({ embeds: [modlogEmbed], ephemeral: true });
+        }
+
+        if (commandName === 'timeout') {
+            if (!interaction.memberPermissions.has(PermissionFlagsBits.ModerateMembers)) {
+                return interaction.reply({ content: '❌ تحتاج صلاحية إدارة الأعضاء (Timeout Members).', ephemeral: true });
+            }
+            const targetUser = options.getUser('user');
+            const reason = options.getString('reason').trim();
+
+            let duration;
+            try { duration = ms(options.getString('duration').trim()); } catch (e) { duration = undefined; }
+            const MAX_TIMEOUT_MS = 28 * 24 * 60 * 60 * 1000; // حد ديسكورد الأقصى
+            if (typeof duration !== 'number' || duration < 5000 || duration > MAX_TIMEOUT_MS) {
+                return interaction.reply({ content: '❌ مدة غير صالحة. اكتب رقم مع وحدة مثل `10m` أو `2h` أو `1d` (من 5 ثواني إلى 28 يوم).', ephemeral: true });
+            }
+
+            const targetMember = await interaction.guild.members.fetch(targetUser.id).catch(() => null);
+            if (!targetMember) return interaction.reply({ content: '❌ هذا العضو مو موجود بالسيرفر.', ephemeral: true });
+
+            const err = validateModTarget(interaction, targetUser, targetMember);
+            if (err) return interaction.reply({ content: err, ephemeral: true });
+            if (!targetMember.moderatable || targetMember.permissions.has(PermissionFlagsBits.Administrator)) {
+                return interaction.reply({ content: '❌ ما أقدر أسكّت هذا العضو (رتبته أعلى من رتبة البوت أو عنده صلاحية أدمن).', ephemeral: true });
+            }
+
+            await interaction.deferReply({ ephemeral: true });
+            const applied = await targetMember.timeout(duration, `${reason} (بواسطة ${interaction.user.username})`.slice(0, 500)).then(() => true).catch(() => false);
+            if (!applied) return interaction.editReply({ content: '❌ فشل تنفيذ الإسكات، تأكد من صلاحيات البوت.' });
+
+            const durationText = formatArabicDuration(duration);
+            const dmSent = await sendModActionDM(targetUser, interaction.guild, '🔇 تم إسكاتك', '#FEE75C', reason, durationText);
+            db.logEvent(interaction.guildId, 'admin', interaction.user.id, 'timeout', { targetUserId: targetUser.id, reason, durationMs: duration, dmSent });
+            sendModLog(interaction.guild, buildModLogEmbed({
+                title: '🔇 إسكات', color: '#FEE75C', targetUser, moderatorId: interaction.user.id, reason,
+                fields: [{ name: 'المدة', value: durationText, inline: true }, { name: 'الخاص', value: dmSent ? 'وصلته الرسالة' : 'الخاص مقفل', inline: true }]
+            }));
+            return interaction.editReply({ content: `✅ تم إسكات ${targetUser} لمدة **${durationText}**.\n${dmSent ? '📩 وصلته رسالة خاصة بالسبب.' : '⚠️ ما قدرت أرسل له خاص (الخاص مقفل عنده).'}` });
+        }
+
+        if (commandName === 'kick') {
+            if (!interaction.memberPermissions.has(PermissionFlagsBits.KickMembers)) {
+                return interaction.reply({ content: '❌ تحتاج صلاحية الطرد (Kick Members).', ephemeral: true });
+            }
+            const targetUser = options.getUser('user');
+            const reason = options.getString('reason').trim();
+
+            const targetMember = await interaction.guild.members.fetch(targetUser.id).catch(() => null);
+            if (!targetMember) return interaction.reply({ content: '❌ هذا العضو مو موجود بالسيرفر.', ephemeral: true });
+
+            const err = validateModTarget(interaction, targetUser, targetMember);
+            if (err) return interaction.reply({ content: err, ephemeral: true });
+            if (!targetMember.kickable) {
+                return interaction.reply({ content: '❌ ما أقدر أطرد هذا العضو (رتبته أعلى من رتبة البوت).', ephemeral: true });
+            }
+
+            await interaction.deferReply({ ephemeral: true });
+            // نرسل الخاص قبل الطرد لأن البوت ما يقدر يراسله بعد ما يطلع من السيرفر
+            const dmSent = await sendModActionDM(targetUser, interaction.guild, '👢 تم طردك', '#ED4245', reason);
+            const applied = await targetMember.kick(`${reason} (بواسطة ${interaction.user.username})`.slice(0, 500)).then(() => true).catch(() => false);
+            if (!applied) return interaction.editReply({ content: '❌ فشل تنفيذ الطرد، تأكد من صلاحيات البوت.' });
+
+            db.logEvent(interaction.guildId, 'admin', interaction.user.id, 'kick', { targetUserId: targetUser.id, reason, dmSent });
+            sendModLog(interaction.guild, buildModLogEmbed({
+                title: '👢 طرد', color: '#ED4245', targetUser, moderatorId: interaction.user.id, reason,
+                fields: [{ name: 'الخاص', value: dmSent ? 'وصلته الرسالة' : 'الخاص مقفل', inline: true }]
+            }));
+            return interaction.editReply({ content: `✅ تم طرد ${targetUser.username}.\n${dmSent ? '📩 وصلته رسالة خاصة بالسبب.' : '⚠️ ما قدرت أرسل له خاص.'}` });
+        }
+
+        if (commandName === 'ban') {
+            if (!interaction.memberPermissions.has(PermissionFlagsBits.BanMembers)) {
+                return interaction.reply({ content: '❌ تحتاج صلاحية الحظر (Ban Members).', ephemeral: true });
+            }
+            const targetUser = options.getUser('user');
+            const reason = options.getString('reason').trim();
+            const deleteDays = options.getInteger('delete_days') ?? 0;
+
+            const targetMember = await interaction.guild.members.fetch(targetUser.id).catch(() => null); // ممكن يكون برا السيرفر (حظر بالآيدي)
+            const err = validateModTarget(interaction, targetUser, targetMember);
+            if (err) return interaction.reply({ content: err, ephemeral: true });
+            if (targetMember && !targetMember.bannable) {
+                return interaction.reply({ content: '❌ ما أقدر أحظر هذا العضو (رتبته أعلى من رتبة البوت).', ephemeral: true });
+            }
+
+            await interaction.deferReply({ ephemeral: true });
+            const dmSent = targetMember ? await sendModActionDM(targetUser, interaction.guild, '🔨 تم حظرك', '#ED4245', reason) : false;
+            const applied = await interaction.guild.members.ban(targetUser.id, {
+                reason: `${reason} (بواسطة ${interaction.user.username})`.slice(0, 500),
+                deleteMessageSeconds: deleteDays * 86400
+            }).then(() => true).catch(() => false);
+            if (!applied) return interaction.editReply({ content: '❌ فشل تنفيذ الحظر، تأكد من صلاحيات البوت.' });
+
+            db.logEvent(interaction.guildId, 'admin', interaction.user.id, 'ban', { targetUserId: targetUser.id, reason, deleteDays, dmSent });
+            sendModLog(interaction.guild, buildModLogEmbed({
+                title: '🔨 حظر', color: '#ED4245', targetUser, moderatorId: interaction.user.id, reason,
+                fields: [
+                    { name: 'حذف الرسائل', value: deleteDays ? `آخر ${deleteDays} يوم` : 'ما انحذف شي', inline: true },
+                    { name: 'الخاص', value: dmSent ? 'وصلته الرسالة' : (targetMember ? 'الخاص مقفل' : 'مو بالسيرفر'), inline: true }
+                ]
+            }));
+            return interaction.editReply({ content: `✅ تم حظر ${targetUser.username}.${targetMember ? (dmSent ? '\n📩 وصلته رسالة خاصة بالسبب.' : '\n⚠️ ما قدرت أرسل له خاص.') : ''}` });
+        }
+
+        if (['warn', 'warnings', 'unwarn', 'clearwarnings'].includes(commandName)) {
+            if (!interaction.memberPermissions.has(PermissionFlagsBits.ModerateMembers)) {
+                return interaction.reply({ content: '❌ تحتاج صلاحية إدارة الأعضاء (Timeout Members) لاستخدام هذا الأمر.', ephemeral: true });
+            }
+        }
+
+        if (commandName === 'warn') {
+            const targetUser = options.getUser('user');
+            const reason = options.getString('reason').trim();
+
+            if (targetUser.bot) return interaction.reply({ content: '❌ ما تقدر تحذّر بوت.', ephemeral: true });
+            if (targetUser.id === interaction.user.id) return interaction.reply({ content: '❌ ما تقدر تحذّر نفسك.', ephemeral: true });
+
+            const targetMember = await interaction.guild.members.fetch(targetUser.id).catch(() => null);
+            if (!targetMember) return interaction.reply({ content: '❌ هذا العضو مو موجود بالسيرفر.', ephemeral: true });
+
+            const isOwner = interaction.guild.ownerId === interaction.user.id;
+            if (targetUser.id === interaction.guild.ownerId || (!isOwner && targetMember.roles.highest.position >= interaction.member.roles.highest.position)) {
+                return interaction.reply({ content: '❌ رتبة هذا العضو أعلى منك أو تساوي رتبتك.', ephemeral: true });
+            }
+
+            await interaction.deferReply({ ephemeral: true });
+            const result = await issueWarning(interaction.guild, targetUser, interaction.user.id, reason);
+
+            const lines = [
+                `✅ تم تحذير ${targetUser} — التحذير رقم **${result.count}/${MAX_WARNINGS}** (رقم السجل \`${result.warningId}\`).`,
+                result.dmSent ? '📩 وصلته رسالة خاصة بالسبب.' : '⚠️ ما قدرت أرسل له خاص (الخاص مقفل عنده).'
+            ];
+            if (result.reachedLimit) {
+                lines.push(result.punished ? `🔇 وصل الحد الأقصى، تم إسكاته ${formatArabicDuration(WARN_PUNISHMENT_MS)}.` : '⚠️ وصل الحد الأقصى بس ما قدرت أنفذ الإسكات (تأكد من رتبة البوت وصلاحياته).');
+            }
+            return interaction.editReply({ content: lines.join('\n') });
+        }
+
+        if (commandName === 'warnings') {
+            const targetUser = options.getUser('user');
+            const list = db.getWarnings(interaction.guildId, targetUser.id, 10);
+            const active = db.countWarnings(interaction.guildId, targetUser.id);
+
+            if (!list.length) return interaction.reply({ content: `✅ ${targetUser} ما عليه أي تحذيرات.`, ephemeral: true });
+
+            const expiryCutoff = Date.now() - db.WARN_EXPIRY_MS;
+            const description = list.map(w => {
+                const expired = w.created_at < expiryCutoff;
+                return `**#${w.id}** — <t:${Math.floor(w.created_at / 1000)}:d> — بواسطة <@${w.moderator_id}>${expired ? ' — *(منتهي)*' : ''}\n> ${w.reason}`;
+            }).join('\n\n');
+
+            const warnsEmbed = new EmbedBuilder()
+                .setTitle(`⚠️ تحذيرات ${targetUser.username} (فعّالة: ${active}/${MAX_WARNINGS})`)
+                .setDescription(description.slice(0, 4000))
+                .setColor('#FEE75C')
+                .setFooter({ text: `التحذيرات المنتهية (أكثر من ${Math.round(db.WARN_EXPIRY_MS / 86400000)} يوم) ما تنحسب بالعدد.` });
+
+            return interaction.reply({ embeds: [warnsEmbed], ephemeral: true });
+        }
+
+        if (commandName === 'unwarn') {
+            const warningId = options.getInteger('id');
+            const removed = db.removeWarning(interaction.guildId, warningId);
+            if (!removed) return interaction.reply({ content: '❌ ما لقيت تحذير بهذا الرقم.', ephemeral: true });
+            db.logEvent(interaction.guildId, 'admin', interaction.user.id, 'warning_removed', { warningId });
+            sendModLog(interaction.guild, buildModLogEmbed({
+                title: '🗑️ حذف تحذير', color: '#8B93A8', moderatorId: interaction.user.id,
+                fields: [{ name: 'رقم التحذير', value: String(warningId), inline: true }]
+            }));
+            return interaction.reply({ content: `✅ تم حذف التحذير رقم \`${warningId}\`.`, ephemeral: true });
+        }
+
+        if (commandName === 'clearwarnings') {
+            const targetUser = options.getUser('user');
+            const removedCount = db.clearWarnings(interaction.guildId, targetUser.id);
+            db.logEvent(interaction.guildId, 'admin', interaction.user.id, 'warnings_cleared', { targetUserId: targetUser.id, removedCount });
+            sendModLog(interaction.guild, buildModLogEmbed({
+                title: '🧹 مسح تحذيرات', color: '#8B93A8', targetUser, moderatorId: interaction.user.id,
+                fields: [{ name: 'عدد المحذوف', value: String(removedCount), inline: true }]
+            }));
+            return interaction.reply({ content: `✅ تم مسح ${removedCount} تحذير من ${targetUser}.`, ephemeral: true });
         }
 
         if (commandName === 'setlevel') {
