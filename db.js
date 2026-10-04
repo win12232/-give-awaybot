@@ -85,6 +85,16 @@ db.exec(`
         purchased_at INTEGER NOT NULL,
         PRIMARY KEY (guild_id, user_id, tier_key)
     );
+
+    CREATE TABLE IF NOT EXISTS warnings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        moderator_id TEXT,          -- من حذّر العضو (أو آيدي البوت لو التحذير تلقائي)
+        reason TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_warnings_user ON warnings (guild_id, user_id);
 `);
 
 // ================= [ ترقية آمنة لجداول قديمة (تضيف أعمدة جديدة لقاعدة بيانات موجودة مسبقاً) ] =================
@@ -108,6 +118,7 @@ safelyAddColumn('config', 'profanity_filter_enabled INTEGER NOT NULL DEFAULT 0')
 safelyAddColumn('config', 'shop_channel_id TEXT');
 safelyAddColumn('config', 'game_channel_id TEXT');
 safelyAddColumn('config', 'stats_channel_id TEXT');
+safelyAddColumn('config', 'modlog_channel_id TEXT');
 
 // ================= [ هجرة تلقائية من الملفات القديمة (مرة وحدة بس) ] =================
 function migrateFromOldFiles() {
@@ -221,14 +232,14 @@ function getConfig(guildId) {
         SELECT leveling_channel_id, welcome_channel_id, welcome_enabled,
                goodbye_channel_id, goodbye_enabled, antispam_enabled,
                antilink_enabled, profanity_filter_enabled, shop_channel_id,
-               game_channel_id, stats_channel_id
+               game_channel_id, stats_channel_id, modlog_channel_id
         FROM config WHERE guild_id = ?
     `).get(guildId);
     return row || {
         leveling_channel_id: null, welcome_channel_id: null, welcome_enabled: 1,
         goodbye_channel_id: null, goodbye_enabled: 1, antispam_enabled: 0,
         antilink_enabled: 0, profanity_filter_enabled: 0, shop_channel_id: null,
-        game_channel_id: null, stats_channel_id: null
+        game_channel_id: null, stats_channel_id: null, modlog_channel_id: null
     };
 }
 
@@ -271,6 +282,13 @@ function setStatsChannel(guildId, channelId) {
     db.prepare(`
         INSERT INTO config (guild_id, stats_channel_id) VALUES (?, ?)
         ON CONFLICT(guild_id) DO UPDATE SET stats_channel_id = excluded.stats_channel_id
+    `).run(guildId, channelId);
+}
+
+function setModlogChannel(guildId, channelId) {
+    db.prepare(`
+        INSERT INTO config (guild_id, modlog_channel_id) VALUES (?, ?)
+        ON CONFLICT(guild_id) DO UPDATE SET modlog_channel_id = excluded.modlog_channel_id
     `).run(guildId, channelId);
 }
 
@@ -445,6 +463,40 @@ function recordVipPurchase(guildId, userId, tierKey) {
     `).run(guildId, userId, tierKey, Date.now());
 }
 
+// ================= [ نظام التحذيرات ] =================
+function addWarning(guildId, userId, moderatorId, reason) {
+    const result = db.prepare(`
+        INSERT INTO warnings (guild_id, user_id, moderator_id, reason, created_at)
+        VALUES (?, ?, ?, ?, ?)
+    `).run(guildId, userId, moderatorId || null, reason, Date.now());
+    return Number(result.lastInsertRowid);
+}
+
+function getWarnings(guildId, userId, limit = 10) {
+    return db.prepare(`
+        SELECT * FROM warnings WHERE guild_id = ? AND user_id = ? ORDER BY id DESC LIMIT ?
+    `).all(guildId, userId, limit);
+}
+
+// مدة صلاحية التحذير — بعدها ما يتحسب بالعدد (يبقى بالسجل للمراجعة بس)
+const WARN_EXPIRY_MS = 30 * 24 * 60 * 60 * 1000; // ٣٠ يوم
+
+// يرجع عدد التحذيرات الفعّالة فقط (غير المنتهية)
+function countWarnings(guildId, userId) {
+    return db.prepare(`
+        SELECT COUNT(*) AS c FROM warnings WHERE guild_id = ? AND user_id = ? AND created_at > ?
+    `).get(guildId, userId, Date.now() - WARN_EXPIRY_MS).c;
+}
+
+// يحذف تحذير واحد بالرقم (بس لو يخص نفس السيرفر)، يرجع true لو انحذف
+function removeWarning(guildId, warningId) {
+    return db.prepare(`DELETE FROM warnings WHERE guild_id = ? AND id = ?`).run(guildId, warningId).changes > 0;
+}
+
+function clearWarnings(guildId, userId) {
+    return db.prepare(`DELETE FROM warnings WHERE guild_id = ? AND user_id = ?`).run(guildId, userId).changes;
+}
+
 module.exports = {
     db,
     getUserLevel,
@@ -472,5 +524,12 @@ module.exports = {
     recordVipPurchase,
     logEvent,
     getLogs,
-    pruneOldLogs
+    pruneOldLogs,
+    addWarning,
+    getWarnings,
+    countWarnings,
+    removeWarning,
+    clearWarnings,
+    setModlogChannel,
+    WARN_EXPIRY_MS
 };
