@@ -1,0 +1,19 @@
+{
+  "name": "mmr-giveaway-bot",
+  "version": "1.0.0",
+  "description": "",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "@napi-rs/canvas": "^1.0.2",
+    "better-sqlite3": "^13.0.3",
+    "discord.js": "^14.14.1",
+    "ms": "^2.1.3",
+    "express": "^4.19.2",
+    "express-session": "^1.18.0",
+    "passport": "^0.7.0",
+    "passport-discord": "^0.1.4"
+  }
+}
